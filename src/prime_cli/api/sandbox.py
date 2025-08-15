@@ -1,11 +1,17 @@
+import os
+import tarfile
+import tempfile
 import time
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+import requests
 from pydantic import BaseModel, ConfigDict, Field
 
 from prime_cli.api.client import APIClient, TimeoutError
+
+from ..utils.debug import debug_log, debug_log_ascii, debug_log_hex
 
 
 class SandboxStatus(str, Enum):
@@ -134,10 +140,34 @@ class CommandResponse(BaseModel):
     exit_code: int
 
 
+class SandboxUploadResponse(BaseModel):
+    """Sandbox upload response model"""
+
+    success: bool
+    message: str
+    files_uploaded: Optional[int] = Field(None, alias="filesUploaded")
+    bytes_uploaded: Optional[int] = Field(None, alias="bytesUploaded")
+    dest_path: str = Field(..., alias="destPath")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class SandboxDownloadStreamResponse(BaseModel):
+    """Sandbox download stream response model"""
+
+    stream: requests.Response
+    src_path: str = Field(..., alias="srcPath")
+    content_type: Optional[str] = Field(None, alias="contentType")
+    content_length: Optional[int] = Field(None, alias="contentLength")
+
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
+
 class SandboxClient:
     """Client for sandbox API operations"""
 
     def __init__(self, api_client: APIClient):
+        debug_log("SandboxClient constructor called")
         self.client = api_client
 
     def create(self, request: CreateSandboxRequest) -> Sandbox:
@@ -231,3 +261,312 @@ class SandboxClient:
                 raise SandboxNotRunningError(sandbox_id, sandbox.status)
             time.sleep(2)
         raise SandboxNotRunningError(sandbox_id, "Timeout during sandbox creation")
+
+    def upload_file(
+        self,
+        sandbox_id: str,
+        dest_path: str,
+        file_path: str,
+        strip_components: int = 0,
+        working_dir: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ) -> SandboxUploadResponse:
+        """Upload a file using multipart form data to the backend.
+
+        This approach is more efficient and follows standard HTTP file upload patterns.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        logger.debug("🚀 Upload File Debug:")
+        logger.debug(f"   Sandbox ID: {sandbox_id}")
+        logger.debug(f"   Local file: {file_path}")
+        logger.debug(f"   Dest path: {dest_path}")
+        logger.debug(f"   Strip components: {strip_components}")
+        logger.debug(f"   Working dir: {working_dir}")
+
+        # Prepare form data
+        form_data: Dict[str, Any] = {
+            "dest_path": dest_path,
+            "compressed": "false",
+            "strip_components": str(strip_components),
+        }
+        if working_dir:
+            form_data["working_dir"] = working_dir
+
+        logger.debug(f"📝 Form data prepared: {form_data}")
+
+        # Prepare file data with appropriate content type
+        content_type = "application/x-tar"
+
+        files_data = {"file": (os.path.basename(file_path), open(file_path, "rb"), content_type)}
+        logger.debug(
+            f"📁 Files data prepared: {list(files_data.keys())} with content-type: {content_type}"
+        )
+
+        try:
+            logger.debug("📤 Sending multipart request...")
+            raw_response = self.client.multipart_post(
+                f"/sandbox/{sandbox_id}/upload",
+                files=files_data,
+                data=form_data,
+                timeout=timeout,
+            )
+            logger.debug(f"✅ Response received: {raw_response}")
+
+            return SandboxUploadResponse(
+                success=raw_response.get("success", True),
+                message=raw_response.get("message", "Upload completed successfully"),
+                filesUploaded=raw_response.get("filesUploaded"),
+                bytesUploaded=raw_response.get("bytesUploaded"),
+                destPath=dest_path,
+            )
+        finally:
+            # Ensure file is closed
+            files_data["file"][1].close()
+            logger.debug("🧹 File handle closed")
+
+    def download_stream(
+        self,
+        sandbox_id: str,
+        src_path: str,
+        working_dir: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ) -> SandboxDownloadStreamResponse:
+        params: Dict[str, Any] = {"src_path": src_path, "compress": "false"}
+        if working_dir:
+            params["working_dir"] = working_dir
+
+        debug_log(
+            f"Making download request to /sandbox/{sandbox_id}/download with params: {params}"
+        )
+        stream_response = self.client.stream_get(
+            f"/sandbox/{sandbox_id}/download", params=params, timeout=timeout
+        )
+
+        debug_log(f"Got response with content-type: {stream_response.headers.get('content-type')}")
+        debug_log(
+            f"Got response with content-length: {stream_response.headers.get('content-length')}"
+        )
+
+        return SandboxDownloadStreamResponse(
+            stream=stream_response,
+            srcPath=src_path,
+            contentType=stream_response.headers.get("content-type"),
+            contentLength=int(stream_response.headers.get("content-length", 0)) or None,
+        )
+
+    def upload_path(
+        self,
+        sandbox_id: str,
+        local_path: str,
+        sandbox_path: str,
+        working_dir: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ) -> SandboxUploadResponse:
+        """Upload a local file or directory to a sandbox.
+
+        This method always creates a tar archive for consistency and reliability.
+        Tar archives handle stream completion naturally and preserve file metadata.
+
+        Args:
+            sandbox_id: ID of the target sandbox
+            local_path: Local path to file or directory
+            sandbox_path: Destination path in the sandbox
+            working_dir: Working directory in the sandbox
+            timeout: Request timeout
+
+        Returns:
+            SandboxUploadResponse with upload details
+        """
+        abs_path = os.path.abspath(local_path)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"Path does not exist: {local_path}")
+
+        # Create tar archive for all uploads (files and directories)
+        temp_file_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".tar") as tmp:
+                temp_file_path = tmp.name
+
+            with tarfile.open(temp_file_path, mode="w:") as tf:
+                if os.path.isfile(local_path):
+                    # For single files, add with just the filename
+                    tf.add(local_path, arcname=os.path.basename(sandbox_path))
+                else:
+                    # For directories, add the entire directory
+                    base_name = os.path.basename(local_path.rstrip("/"))
+                    tf.add(local_path, arcname=base_name)
+
+            # Upload the archive
+            result = self.upload_file(
+                sandbox_id,
+                sandbox_path,
+                temp_file_path,
+                working_dir=working_dir,
+                timeout=timeout,
+            )
+
+            return result
+
+        finally:
+            # Clean up temporary file
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                except Exception:
+                    pass
+
+    def download_path(
+        self,
+        sandbox_id: str,
+        sandbox_path: str,
+        local_path: str,
+        working_dir: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ) -> None:
+        debug_log(
+            f"download_path called with sandbox_id={sandbox_id}, "
+            f"sandbox_path={sandbox_path}, local_path={local_path}"
+        )
+
+        """Download a file or directory from a sandbox to local path.
+
+        This method handles:
+        - Downloading the stream
+        - Extracting tar archives
+        - Proper handling of single files vs directories
+        - Temporary file management
+        - Cleanup
+
+        Args:
+            sandbox_id: ID of the source sandbox
+            sandbox_path: Path in the sandbox to download
+            local_path: Local destination path
+            working_dir: Working directory in the sandbox
+            timeout: Request timeout
+        """
+        # Download from sandbox
+        response = self.download_stream(
+            sandbox_id, sandbox_path, working_dir=working_dir, timeout=timeout
+        )
+
+        if response.content_length == 0:
+            raise Exception("No data received from sandbox. The source path may not exist.")
+
+        # Save stream to temp file first
+        temp_file_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".tar") as tmp_file:
+                temp_file_path = tmp_file.name
+
+                total_bytes = 0
+                for chunk in response.stream.iter_content(chunk_size=1024 * 64):
+                    if chunk:
+                        tmp_file.write(chunk)
+                        total_bytes += len(chunk)
+
+                debug_log(f"Downloaded {total_bytes} bytes to {temp_file_path}")
+
+                # Check the first few bytes to see what we got
+                with open(temp_file_path, "rb") as f:
+                    first_bytes = f.read(100)
+                    debug_log_hex("First 100 bytes", first_bytes)
+                    debug_log_ascii("First 100 bytes", first_bytes)
+
+            # Extract the archive - use raw tar format
+            debug_log(f"Attempting to open tar file: {temp_file_path}")
+            tf = None
+            members = None
+            try:
+                tf = tarfile.open(temp_file_path, mode="r:")
+                members = list(tf.getmembers())
+                debug_log(f"Successfully opened tar file with {len(members)} members")
+            except Exception as e:
+                debug_log(f"Failed to open tar file with mode 'r:': {e}")
+                # Try with different mode - explicitly specify no compression
+                tf = tarfile.open(temp_file_path, mode="r")
+                members = list(tf.getmembers())
+                debug_log(f"Successfully opened tar file with mode 'r' with {len(members)} members")
+
+            if not members:
+                raise Exception("Tar archive is empty")
+
+            # Determine if this is a single file or directory based on the tar archive contents
+            # If the archive contains multiple members or the first member is a directory,
+            # treat as directory
+            is_single_file = len(members) == 1 and members[0].isfile()
+            debug_log(f"local_path='{local_path}', is_single_file={is_single_file}")
+            debug_log(
+                f"members count={len(members)}, "
+                f"first member isfile={members[0].isfile() if members else 'N/A'}"
+            )
+
+            # Ensure destination directory exists
+            dst_abs = os.path.abspath(local_path)
+            if is_single_file:
+                # For single files, ensure parent directory exists
+                os.makedirs(os.path.dirname(dst_abs), exist_ok=True)
+            else:
+                # For directories, ensure the directory itself exists
+                os.makedirs(dst_abs, exist_ok=True)
+
+            try:
+                debug_log(f"Starting extraction, is_single_file={is_single_file}")
+                if is_single_file:
+                    debug_log("Handling as single file")
+                    # Handle single file extraction
+                    # Find the first file in the archive and extract it to the exact destination
+                    for member in members:
+                        if member.isfile():
+                            extract_file = tf.extractfile(member)
+                            if extract_file is not None:
+                                with open(dst_abs, "wb") as f:
+                                    f.write(extract_file.read())
+                                break
+                            else:
+                                raise Exception(f"Failed to extract file member: {member.name}")
+                    else:
+                        raise Exception("No file found in the archive")
+                else:
+                    debug_log("Handling as directory")
+                    # Handle directory extraction
+                    # Extract all members, removing the first path component if it exists
+                    debug_log(f"Extracting directory with {len(members)} members")
+                    for member in members:
+                        debug_log(
+                            f"Processing member: {member.name} "
+                            f"(isfile: {member.isfile()}, isdir: {member.isdir()})"
+                        )
+                        # Create a copy of the member with modified name
+                        if "/" in member.name:
+                            new_name = "/".join(member.name.split("/")[1:])
+                            debug_log(f"Renaming member from '{member.name}' to '{new_name}'")
+                            # Create a new TarInfo object with the modified name
+                            new_member = tarfile.TarInfo(name=new_name)
+                            new_member.size = member.size
+                            new_member.mode = member.mode
+                            new_member.type = member.type
+                            new_member.linkname = member.linkname
+                            new_member.uid = member.uid
+                            new_member.gid = member.gid
+                            new_member.uname = member.uname
+                            new_member.gname = member.gname
+                            new_member.mtime = member.mtime
+                            new_member.devmajor = member.devmajor
+                            new_member.devminor = member.devminor
+                            tf.extract(new_member, path=dst_abs)
+                        else:
+                            tf.extract(member, path=dst_abs)
+            finally:
+                if tf:
+                    tf.close()
+
+        finally:
+            # Clean up temporary file
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                except Exception:
+                    pass
