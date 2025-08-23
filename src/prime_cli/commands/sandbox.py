@@ -11,10 +11,97 @@ from rich.text import Text
 from ..api.client import APIClient, APIError
 from ..api.sandbox import CreateSandboxRequest, SandboxClient
 from ..config import Config
+from ..utils.debug import debug_log, set_debug_enabled
+from .utils import (
+    _expand_home_in_path,
+    _parse_cp_arg,
+)
 
 app = typer.Typer(help="Manage code sandboxes")
 console = Console()
 config = Config()
+
+
+def _handle_local_to_sandbox(
+    sandbox_client: SandboxClient,
+    source_path: str,
+    sandbox_id: str,
+    destination_path: str,
+    working_dir: Optional[str],
+) -> None:
+    """Handle copying from local to sandbox."""
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    logger.debug("🔄 Local to Sandbox Copy Debug:")
+    logger.debug(f"   Source path: {source_path}")
+    logger.debug(f"   Sandbox ID: {sandbox_id}")
+    logger.debug(f"   Destination path: {destination_path}")
+    logger.debug(f"   Working dir: {working_dir}")
+
+    console.print(
+        f"[blue]Uploading {source_path} to sandbox {sandbox_id}:{destination_path}...[/blue]"
+    )
+
+    try:
+        with console.status("[bold blue]Uploading...", spinner="dots"):
+            logger.debug("📤 Calling sandbox_client.upload_path...")
+            result = sandbox_client.upload_path(
+                sandbox_id,
+                source_path,
+                destination_path,
+                working_dir=working_dir,
+            )
+            logger.debug(f"✅ upload_path result: {result}")
+
+        # Success output
+        console.print(f"[green]Upload completed[/green] {result.message}")
+        if result.files_uploaded:
+            console.print(f"Files uploaded: {result.files_uploaded}")
+        if result.bytes_uploaded:
+            console.print(f"Bytes uploaded: {result.bytes_uploaded}")
+
+    except Exception as e:
+        logger.error(f"❌ Upload failed with exception: {e}")
+        logger.error(f"   Exception type: {type(e)}")
+        console.print(f"[red]Upload failed:[/red] {e}")
+        raise
+
+
+def _handle_sandbox_to_local(
+    sandbox_client: SandboxClient,
+    sandbox_id: str,
+    source_path: str,
+    destination_path: str,
+    working_dir: Optional[str],
+) -> None:
+    """Handle copying from sandbox to local."""
+    debug_log(
+        f"_handle_sandbox_to_local called with sandbox_id={sandbox_id}, "
+        f"source_path={source_path}, destination_path={destination_path}"
+    )
+
+    console.print(
+        f"[blue]Downloading from sandbox {sandbox_id}:{source_path} to {destination_path}...[/blue]"
+    )
+
+    try:
+        debug_log("About to call sandbox_client.download_path")
+        with console.status("[bold blue]Downloading...", spinner="dots"):
+            sandbox_client.download_path(
+                sandbox_id,
+                source_path,
+                destination_path,
+                working_dir=working_dir,
+            )
+
+        console.print(f"[green]Download completed to {destination_path}[/green]")
+
+    except Exception as e:
+        debug_log(f"Exception caught in _handle_sandbox_to_local: {e}")
+        console.print(f"[red]Download failed:[/red] {e}")
+        raise
 
 
 def _obfuscate_env_vars(env_vars: dict) -> dict:
@@ -396,6 +483,72 @@ def run(
         if result.exit_code != 0:
             console.print(f"\n[bold yellow]Exit code:[/bold yellow] {result.exit_code}")
             raise typer.Exit(result.exit_code)
+
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error:[/red] {str(e)}")
+        raise typer.Exit(1)
+
+
+@app.command("cp")
+def cp(
+    ctx: typer.Context,
+    source: str = typer.Argument(
+        ..., help="Source path or <sandbox-id>:<path>", show_default=False
+    ),
+    destination: str = typer.Argument(
+        ..., help="Destination path or <sandbox-id>:<path>", show_default=False
+    ),
+    working_dir: Optional[str] = typer.Option(
+        None, "-w", "--working-dir", help="Sandbox working dir"
+    ),
+) -> None:
+    """Copy files or folders between local and a sandbox.
+
+    Examples:
+      prime sandbox cp ./localdir <sandbox>:work
+      prime sandbox cp <sandbox>:/work/out ./localdir
+    """
+    try:
+        # Set debug flag from context
+        debug_enabled = ctx.obj.get("debug", False) if ctx.obj else False
+        set_debug_enabled(debug_enabled)
+
+        debug_log(f"cp command called with source={source}, destination={destination}")
+        base_client = APIClient()
+        sandbox_client = SandboxClient(base_client)
+
+        src_sid, src_path = _parse_cp_arg(source)
+        dst_sid, dst_path = _parse_cp_arg(destination)
+        debug_log(
+            f"Parsed args: src_sid={src_sid}, src_path={src_path}, "
+            f"dst_sid={dst_sid}, dst_path={dst_path}"
+        )
+
+        # Expand $HOME in sandbox paths for user convenience
+        if src_sid is not None:
+            src_path = _expand_home_in_path(src_path)
+        if dst_sid is not None:
+            dst_path = _expand_home_in_path(dst_path)
+
+        if (src_sid is None) == (dst_sid is None):
+            console.print("[red]One side must be a sandbox, the other must be local.[/red]")
+            raise typer.Exit(1)
+
+        # Local -> Sandbox
+        if src_sid is None and dst_sid is not None:
+            _handle_local_to_sandbox(sandbox_client, src_path, dst_sid, dst_path, working_dir)
+            return
+
+        # Sandbox -> Local
+        if src_sid is not None and dst_sid is None:
+            _handle_sandbox_to_local(sandbox_client, src_sid, src_path, dst_path, working_dir)
+            return
+
+        console.print("[red]Unsupported copy direction[/red]")
+        raise typer.Exit(1)
 
     except APIError as e:
         console.print(f"[red]Error:[/red] {str(e)}")

@@ -1,8 +1,9 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import requests
 
 from ..config import Config
+from ..utils.debug import debug_log
 
 
 class APIError(Exception):
@@ -31,6 +32,7 @@ class TimeoutError(APIError):
 
 class APIClient:
     def __init__(self, api_key: Optional[str] = None, require_auth: bool = True):
+        debug_log("APIClient constructor called")
         # Load config
         self.config = Config()
 
@@ -77,10 +79,10 @@ class APIClient:
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401:
                 raise UnauthorizedError(
-                    "API key unauthorized. ",
+                    "API key unauthorized. "
                     "Please check that your API key has the correct permissions, "
                     "generate a new one at https://app.primeintellect.ai/dashboard/tokens, "
-                    "or run 'prime login' to configure a new API key.",
+                    "or run 'prime login' to configure a new API key."
                 )
             if e.response.status_code == 402:
                 raise PaymentRequiredError(
@@ -113,6 +115,182 @@ class APIClient:
     def delete(self, endpoint: str) -> Dict[str, Any]:
         """Make a DELETE request to the API"""
         return self.request("DELETE", endpoint)
+
+    def _build_url(self, endpoint: str) -> str:
+        if not endpoint.startswith("/"):
+            endpoint = f"/api/v1/{endpoint}"
+        else:
+            endpoint = f"/api/v1{endpoint}"
+        return f"{self.base_url}{endpoint}"
+
+    def stream_post(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        data: Optional[Iterable[bytes]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        timeout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        url = self._build_url(endpoint)
+        req_headers = {"Accept": "application/json", "Content-Type": "application/octet-stream"}
+        if headers:
+            req_headers.update(headers)
+        try:
+            response = self.session.request(
+                "POST",
+                url,
+                params=params,
+                data=data,
+                headers=req_headers,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            result = response.json()
+            if not isinstance(result, dict):
+                raise APIError("API response was not a dictionary")
+            return result
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                raise UnauthorizedError(
+                    "API key unauthorized. "
+                    "Please check that your API key has the correct permissions, "
+                    "generate a new one at https://app.primeintellect.ai/dashboard/tokens, "
+                    "or run 'prime login' to configure a new API key."
+                )
+            if e.response.status_code == 402:
+                raise PaymentRequiredError(
+                    "Payment required. Please check your billing status at "
+                    "https://app.primeintellect.ai/dashboard/billing"
+                )
+            try:
+                error_response = e.response.json()
+                if isinstance(error_response, dict) and "detail" in error_response:
+                    raise APIError(f"HTTP {e.response.status_code}: {error_response['detail']}")
+            except (ValueError, KeyError):
+                pass
+            raise APIError(f"HTTP {e.response.status_code}: {e.response.text or str(e)}")
+        except requests.exceptions.Timeout as e:
+            raise TimeoutError(f"Request timed out: {e}")
+        except requests.exceptions.RequestException as e:
+            raise APIError(f"Request failed: {e}")
+
+    def multipart_post(
+        self,
+        endpoint: str,
+        files: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        timeout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Send a multipart form POST request (for file uploads)"""
+        url = self._build_url(endpoint)
+        req_headers = {"Accept": "application/json"}
+
+        # Debug logging
+        import logging
+
+        logger = logging.getLogger(__name__)
+        logger.debug("🔍 Multipart POST Debug:")
+        logger.debug(f"   URL: {url}")
+        logger.debug(f"   Headers: {req_headers}")
+        logger.debug(f"   Files: {files}")
+        logger.debug(f"   Data: {data}")
+
+        try:
+            # For multipart requests, we need to let requests set the Content-Type automatically
+            # Create a temporary session without the default Content-Type header
+            temp_session = requests.Session()
+            temp_session.headers.update(
+                {
+                    "Accept": "application/json",
+                    "Authorization": self.session.headers.get("Authorization", ""),
+                }
+            )
+
+            response = temp_session.request(
+                "POST",
+                url,
+                files=files,
+                data=data,
+                headers=req_headers,
+                timeout=timeout,
+            )
+
+            # Debug response
+            logger.debug("📡 Response Debug:")
+            logger.debug(f"   Status: {response.status_code}")
+            logger.debug(f"   Headers: {dict(response.headers)}")
+            logger.debug(f"   Content-Type: {response.headers.get('content-type', 'N/A')}")
+
+            response.raise_for_status()
+            result = response.json()
+            if not isinstance(result, dict):
+                raise APIError("API response was not a dictionary")
+            return result
+        except requests.exceptions.HTTPError as e:
+            # Enhanced error logging
+            logger.error(f"❌ HTTP Error {e.response.status_code}:")
+            logger.error(f"   Response text: {e.response.text}")
+            logger.error(f"   Response headers: {dict(e.response.headers)}")
+
+            if e.response.status_code == 401:
+                raise UnauthorizedError(
+                    "API key unauthorized. "
+                    "Please check that your API key has the correct permissions, "
+                    "generate a new one at https://app.primeintellect.ai/dashboard/tokens, "
+                    "or run 'prime login' to configure a new API key."
+                )
+            if e.response.status_code == 402:
+                raise PaymentRequiredError(
+                    "Payment required. Please check your billing status at "
+                    "https://app.primeintellect.ai/dashboard/billing"
+                )
+            try:
+                error_response = e.response.json()
+                if isinstance(error_response, dict) and "detail" in error_response:
+                    raise APIError(f"HTTP {e.response.status_code}: {error_response['detail']}")
+            except (ValueError, KeyError):
+                pass
+            raise APIError(f"HTTP {e.response.status_code}: {e.response.text or str(e)}")
+        except requests.exceptions.Timeout as e:
+            raise TimeoutError(f"Request timed out: {e}")
+        except requests.exceptions.RequestException as e:
+            raise APIError(f"Request failed: {e}")
+
+    def stream_get(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: Optional[int] = None,
+    ) -> requests.Response:
+        url = self._build_url(endpoint)
+        try:
+            response = self.session.request("GET", url, params=params, stream=True, timeout=timeout)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                raise UnauthorizedError(
+                    "API key unauthorized. "
+                    "Please check that your API key has the correct permissions, "
+                    "generate a new one at https://app.primeintellect.ai/dashboard/tokens, "
+                    "or run 'prime login' to configure a new API key."
+                )
+            if e.response.status_code == 402:
+                raise PaymentRequiredError(
+                    "Payment required. Please check your billing status at "
+                    "https://app.primeintellect.ai/dashboard/billing"
+                )
+            try:
+                error_response = e.response.json()
+                if isinstance(error_response, dict) and "detail" in error_response:
+                    raise APIError(f"HTTP {e.response.status_code}: {error_response['detail']}")
+            except (ValueError, KeyError):
+                pass
+            raise APIError(f"HTTP {e.response.status_code}: {e.response.text or str(e)}")
+        except requests.exceptions.Timeout as e:
+            raise TimeoutError(f"Request timed out: {e}")
+        except requests.exceptions.RequestException as e:
+            raise APIError(f"Request failed: {e}")
 
     def __str__(self) -> str:
         """For debugging"""
