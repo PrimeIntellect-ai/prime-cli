@@ -1,8 +1,9 @@
+import asyncio
 import json
 import random
 import string
 import time
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 import typer
 from rich.console import Console
@@ -10,20 +11,22 @@ from rich.table import Table
 from rich.text import Text
 
 from ..api.client import APIClient, APIError
-from ..api.sandbox import CreateSandboxRequest, Sandbox, SandboxClient
+from ..api.sandbox import AsyncSandboxClient, CreateSandboxRequest, SandboxClient
 from ..config import Config
 from ..utils import (
     build_table,
     confirm_or_skip,
-    format_resources,
-    human_age,
-    iso_timestamp,
+    expand_home_in_path,
+    format_sandbox_for_details,
+    format_sandbox_for_list,
     obfuscate_env_vars,
     output_data_as_json,
+    parse_cp_arg,
     sort_by_created,
     status_color,
     validate_output_format,
 )
+from ..utils.debug import debug_log, set_debug_enabled
 from ..utils.display import SANDBOX_STATUS_COLORS
 
 app = typer.Typer(help="Manage code sandboxes")
@@ -31,56 +34,12 @@ console = Console()
 config = Config()
 
 
-def _format_sandbox_for_list(sandbox: Sandbox) -> Dict[str, Any]:
-    """Format sandbox data for list display (both table and JSON)"""
-    return {
-        "id": sandbox.id,
-        "name": sandbox.name,
-        "image": sandbox.docker_image,
-        "status": sandbox.status,
-        "resources": format_resources(sandbox.cpu_cores, sandbox.memory_gb, sandbox.gpu_count),
-        "created_at": iso_timestamp(sandbox.created_at),  # For JSON output
-        "age": human_age(sandbox.created_at),  # For table output
-    }
-
-
-def _format_sandbox_for_details(sandbox: Sandbox) -> Dict[str, Any]:
-    """Format sandbox data for details display (both table and JSON)"""
-    data: Dict[str, Any] = {
-        "id": sandbox.id,
-        "name": sandbox.name,
-        "docker_image": sandbox.docker_image,
-        "start_command": sandbox.start_command,
-        "status": sandbox.status,
-        "cpu_cores": sandbox.cpu_cores,
-        "memory_gb": sandbox.memory_gb,
-        "disk_size_gb": sandbox.disk_size_gb,
-        "disk_mount_path": sandbox.disk_mount_path,
-        "gpu_count": sandbox.gpu_count,
-        "timeout_minutes": sandbox.timeout_minutes,
-        "created_at": iso_timestamp(sandbox.created_at),
-        "user_id": sandbox.user_id,
-        "team_id": sandbox.team_id,
-    }
-
-    if sandbox.started_at:
-        data["started_at"] = iso_timestamp(sandbox.started_at)
-    if sandbox.terminated_at:
-        data["terminated_at"] = iso_timestamp(sandbox.terminated_at)
-    if sandbox.environment_vars:
-        data["environment_vars"] = obfuscate_env_vars(sandbox.environment_vars)
-    if sandbox.advanced_configs:
-        data["advanced_configs"] = sandbox.advanced_configs.model_dump()
-
-    return data
-
-
 @app.command("list")
 def list_sandboxes_cmd(
-    team_id: Optional[str] = typer.Option(
+    team_id: str | None = typer.Option(
         None, help="Filter by team ID (uses config team_id if not specified)"
     ),
-    status: Optional[str] = typer.Option(None, help="Filter by status"),
+    status: str | None = typer.Option(None, help="Filter by status"),
     page: int = typer.Option(1, help="Page number"),
     per_page: int = typer.Option(50, help="Items per page"),
     all: bool = typer.Option(False, "--all", help="Show all sandboxes including terminated ones"),
@@ -123,7 +82,7 @@ def list_sandboxes_cmd(
             # Output as JSON with timestamp (for automation)
             sandboxes_data = []
             for sandbox in sorted_sandboxes:
-                sandbox_data = _format_sandbox_for_list(sandbox)
+                sandbox_data = format_sandbox_for_list(sandbox)
                 # For JSON, use timestamp instead of age
                 json_sandbox = {
                     "id": sandbox_data["id"],
@@ -146,7 +105,7 @@ def list_sandboxes_cmd(
         else:
             # Output as table using shared formatting
             for sandbox in sorted_sandboxes:
-                sandbox_data = _format_sandbox_for_list(sandbox)
+                sandbox_data = format_sandbox_for_list(sandbox)
 
                 color = status_color(sandbox_data["status"], SANDBOX_STATUS_COLORS)
 
@@ -191,11 +150,11 @@ def get(
 
         if output == "json":
             # Output as JSON using shared formatting
-            sandbox_data = _format_sandbox_for_details(sandbox)
+            sandbox_data = format_sandbox_for_details(sandbox)
             output_data_as_json(sandbox_data, console)
         else:
             # Output as table using shared formatting
-            sandbox_data = _format_sandbox_for_details(sandbox)
+            sandbox_data = format_sandbox_for_details(sandbox)
 
             table = Table(title=f"Sandbox Details: {sandbox_id}")
             table.add_column("Property", style="cyan")
@@ -246,10 +205,10 @@ def get(
 @app.command()
 def create(
     docker_image: str = typer.Argument(..., help="Docker image to run"),
-    name: Optional[str] = typer.Option(
+    name: str | None = typer.Option(
         None, help="Name for the sandbox (auto-generated if not provided)"
     ),
-    start_command: Optional[str] = typer.Option(
+    start_command: str | None = typer.Option(
         "tail -f /dev/null", help="Command to run in the container"
     ),
     cpu_cores: int = typer.Option(1, help="Number of CPU cores"),
@@ -257,7 +216,7 @@ def create(
     disk_size_gb: int = typer.Option(10, help="Disk size in GB"),
     gpu_count: int = typer.Option(0, help="Number of GPUs"),
     timeout_minutes: int = typer.Option(60, help="Timeout in minutes"),
-    team_id: Optional[str] = typer.Option(
+    team_id: str | None = typer.Option(
         None, help="Team ID (uses config team_id if not specified)"
     ),
     env: Optional[List[str]] = typer.Option(
@@ -304,7 +263,7 @@ def create(
             disk_size_gb=disk_size_gb,
             gpu_count=gpu_count,
             timeout_minutes=timeout_minutes,
-            environment_vars=env_vars if env_vars else None,
+            environment_vars=env_vars if env_vars else {},
             team_id=team_id,
         )
 
@@ -418,7 +377,7 @@ def status(sandbox_id: str) -> None:
 def run(
     sandbox_id: str,
     command: List[str] = typer.Argument(..., help="Command to execute"),
-    working_dir: Optional[str] = typer.Option(
+    working_dir: str | None = typer.Option(
         None, "-w", "--working-dir", help="Working directory"
     ),
     env: Optional[List[str]] = typer.Option(
@@ -458,7 +417,7 @@ def run(
 
         with console.status("[bold blue]Running command...", spinner="dots"):
             result = sandbox_client.execute_command(
-                sandbox_id, command_str, working_dir, env_vars if env_vars else None
+                sandbox_id, command_str, working_dir, dict(env_vars) if env_vars else None
             )
 
         # End timing
@@ -479,6 +438,131 @@ def run(
         if result.exit_code != 0:
             console.print(f"\n[bold yellow]Exit code:[/bold yellow] {result.exit_code}")
             raise typer.Exit(result.exit_code)
+
+    except APIError as e:
+        console.print(f"[red]Error:[/red] {str(e)}")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"[red]Unexpected error:[/red] {str(e)}")
+        raise typer.Exit(1)
+
+
+async def async_upload_to_sandbox(
+    sandbox_id: str,
+    source_path: str, 
+    destination_path: str,
+    working_dir: str | None,
+    console: Console,
+) -> None:
+    """Async helper for uploading to sandbox."""
+    console.print(
+        f"[blue]Uploading {source_path} to sandbox {sandbox_id}:{destination_path}...[/blue]"
+    )
+    
+    async with AsyncSandboxClient() as async_client:
+        try:
+            with console.status("[bold blue]Uploading...", spinner="dots"):
+                result = await async_client.upload_path(
+                    sandbox_id,
+                    source_path,
+                    destination_path,
+                    working_dir=working_dir,
+                )
+            
+            # Success output
+            console.print(f"[green]Upload completed[/green] {result.message}")
+            if result.files_uploaded:
+                console.print(f"Files uploaded: {result.files_uploaded}")
+            if result.bytes_uploaded:
+                console.print(f"Bytes uploaded: {result.bytes_uploaded}")
+        except Exception as e:
+            console.print(f"[red]Upload failed:[/red] {e}")
+            raise
+
+
+async def async_download_from_sandbox(
+    sandbox_id: str,
+    source_path: str,
+    destination_path: str,
+    working_dir: str | None,
+    console: Console,
+) -> None:
+    """Async helper for downloading from sandbox."""
+    console.print(
+        f"[blue]Downloading from sandbox {sandbox_id}:{source_path} to {destination_path}...[/blue]"
+    )
+    
+    async with AsyncSandboxClient() as async_client:
+        try:
+            with console.status("[bold blue]Downloading...", spinner="dots"):
+                await async_client.download_path(
+                    sandbox_id,
+                    source_path,
+                    destination_path,
+                    working_dir=working_dir,
+                )
+            
+            console.print(f"[green]Download completed to {destination_path}[/green]")
+        except Exception as e:
+            console.print(f"[red]Download failed:[/red] {e}")
+            raise
+
+
+@app.command("cp")
+def cp(
+    ctx: typer.Context,
+    source: str = typer.Argument(
+        ..., help="Source path or <sandbox-id>:<path>", show_default=False
+    ),
+    destination: str = typer.Argument(
+        ..., help="Destination path or <sandbox-id>:<path>", show_default=False
+    ),
+    working_dir: str | None = typer.Option(
+        None, "-w", "--working-dir", help="Sandbox working dir"
+    ),
+) -> None:
+    """Copy files or folders between local and a sandbox.
+
+    Examples:
+      prime sandbox cp ./localdir <sandbox>:work
+      prime sandbox cp <sandbox>:/work/out ./localdir
+    """
+    try:
+        # Set debug flag from context
+        debug_enabled = ctx.obj.get("debug", False) if ctx.obj else False
+        set_debug_enabled(debug_enabled)
+
+        debug_log(f"cp command called with source={source}, destination={destination}")
+
+        src_sid, src_path = parse_cp_arg(source)
+        dst_sid, dst_path = parse_cp_arg(destination)
+        debug_log(
+            f"Parsed args: src_sid={src_sid}, src_path={src_path}, "
+            f"dst_sid={dst_sid}, dst_path={dst_path}"
+        )
+
+        # Expand $HOME in sandbox paths for user convenience
+        if src_sid is not None:
+            src_path = expand_home_in_path(src_path)
+        if dst_sid is not None:
+            dst_path = expand_home_in_path(dst_path)
+
+        if (src_sid is None) == (dst_sid is None):
+            console.print("[red]One side must be a sandbox, the other must be local.[/red]")
+            raise typer.Exit(1)
+
+        # Local -> Sandbox
+        if src_sid is None and dst_sid is not None:
+            asyncio.run(async_upload_to_sandbox(dst_sid, src_path, dst_path, working_dir, console))
+            return
+
+        # Sandbox -> Local
+        if src_sid is not None and dst_sid is None:
+            asyncio.run(async_download_from_sandbox(src_sid, src_path, dst_path, working_dir, console))
+            return
+
+        console.print("[red]Unsupported copy direction[/red]")
+        raise typer.Exit(1)
 
     except APIError as e:
         console.print(f"[red]Error:[/red] {str(e)}")

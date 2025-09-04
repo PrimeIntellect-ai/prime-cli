@@ -1,11 +1,61 @@
+import asyncio
+import os
+import tarfile
+import tempfile
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any
 
+import aiofiles
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from prime_cli.api.client import APIClient, AsyncAPIClient, TimeoutError
+
+from ..utils.debug import debug_log
+
+# Security constants
+
+
+def is_safe_path(basedir: str, path: str, follow_symlinks: bool = True) -> bool:
+    """Check if a path is safe (doesn't escape the base directory).
+    
+    This prevents path traversal attacks like ../../etc/passwd
+    """
+    if follow_symlinks:
+        resolved = os.path.realpath(os.path.join(basedir, path))
+    else:
+        resolved = os.path.abspath(os.path.join(basedir, path))
+    return resolved.startswith(os.path.realpath(basedir))
+
+
+def validate_tar_member(member: tarfile.TarInfo, dest_path: str) -> bool:
+    """Validate a tar member is safe to extract.
+    
+    Checks for:
+    - Path traversal attempts
+    - Absolute paths
+    - Symlinks pointing outside destination
+    """
+    # Check for absolute paths
+    if member.name.startswith('/'):
+        return False
+    
+    # Check for path traversal
+    if '..' in member.name or member.name.startswith('~'):
+        return False
+    
+    # Validate the destination path
+    if not is_safe_path(dest_path, member.name):
+        return False
+    
+    # Check symlink targets
+    if member.issym() or member.islnk():
+        if not is_safe_path(dest_path, member.linkname):
+            return False
+    
+    return True
 
 
 class SandboxStatus(str, Enum):
@@ -22,7 +72,7 @@ class SandboxStatus(str, Enum):
 class SandboxNotRunningError(RuntimeError):
     """Raised when an operation requires a RUNNING sandbox but it is not running."""
 
-    def __init__(self, sandbox_id: str, status: Optional[str] = None):
+    def __init__(self, sandbox_id: str, status: str | None = None):
         msg = f"Sandbox {sandbox_id} is not running" + (f" (status={status})" if status else ".")
         super().__init__(msg)
 
@@ -49,7 +99,7 @@ class Sandbox(BaseModel):
     id: str
     name: str
     docker_image: str = Field(..., alias="dockerImage")
-    start_command: Optional[str] = Field(None, alias="startCommand")
+    start_command: str | None = Field(None, alias="startCommand")
     cpu_cores: int = Field(..., alias="cpuCores")
     memory_gb: int = Field(..., alias="memoryGB")
     disk_size_gb: int = Field(..., alias="diskSizeGB")
@@ -57,15 +107,15 @@ class Sandbox(BaseModel):
     gpu_count: int = Field(..., alias="gpuCount")
     status: str
     timeout_minutes: int = Field(..., alias="timeoutMinutes")
-    environment_vars: Optional[Dict[str, Any]] = Field(None, alias="environmentVars")
-    advanced_configs: Optional[AdvancedConfigs] = Field(None, alias="advancedConfigs")
+    environment_vars: dict[str, Any] | None = Field(None, alias="environmentVars")
+    advanced_configs: AdvancedConfigs | None = Field(None, alias="advancedConfigs")
     created_at: datetime = Field(..., alias="createdAt")
     updated_at: datetime = Field(..., alias="updatedAt")
-    started_at: Optional[datetime] = Field(None, alias="startedAt")
-    terminated_at: Optional[datetime] = Field(None, alias="terminatedAt")
-    user_id: Optional[str] = Field(None, alias="userId")
-    team_id: Optional[str] = Field(None, alias="teamId")
-    kubernetes_job_id: Optional[str] = Field(None, alias="kubernetesJobId")
+    started_at: datetime | None = Field(None, alias="startedAt")
+    terminated_at: datetime | None = Field(None, alias="terminatedAt")
+    user_id: str | None = Field(None, alias="userId")
+    team_id: str | None = Field(None, alias="teamId")
+    kubernetes_job_id: str | None = Field(None, alias="kubernetesJobId")
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -73,7 +123,7 @@ class Sandbox(BaseModel):
 class SandboxListResponse(BaseModel):
     """Sandbox list response model"""
 
-    sandboxes: List[Sandbox]
+    sandboxes: list[Sandbox]
     total: int
     page: int
     per_page: int = Field(..., alias="perPage")
@@ -93,37 +143,37 @@ class CreateSandboxRequest(BaseModel):
 
     name: str
     docker_image: str
-    start_command: Optional[str] = None
+    start_command: str | None = None
     cpu_cores: int = 1
     memory_gb: int = 2
     disk_size_gb: int = 10
     gpu_count: int = 0
     timeout_minutes: int = 60
-    environment_vars: Optional[Dict[str, str]] = None
-    team_id: Optional[str] = None
-    advanced_configs: Optional[AdvancedConfigs] = None
+    environment_vars: dict[str, str] | None = None
+    team_id: str | None = None
+    advanced_configs: AdvancedConfigs | None = None
 
 
 class UpdateSandboxRequest(BaseModel):
     """Update sandbox request model"""
 
-    name: Optional[str] = None
-    docker_image: Optional[str] = None
-    start_command: Optional[str] = None
-    cpu_cores: Optional[int] = None
-    memory_gb: Optional[int] = None
-    disk_size_gb: Optional[int] = None
-    gpu_count: Optional[int] = None
-    timeout_minutes: Optional[int] = None
-    environment_vars: Optional[Dict[str, str]] = None
+    name: str | None = None
+    docker_image: str | None = None
+    start_command: str | None = None
+    cpu_cores: int | None = None
+    memory_gb: int | None = None
+    disk_size_gb: int | None = None
+    gpu_count: int | None = None
+    timeout_minutes: int | None = None
+    environment_vars: dict[str, str] | None = None
 
 
 class CommandRequest(BaseModel):
     """Execute command request model"""
 
     command: str
-    working_dir: Optional[str] = None
-    env: Optional[Dict[str, str]] = None
+    working_dir: str | None = None
+    env: dict[str, str] | None = None
 
 
 class CommandResponse(BaseModel):
@@ -134,10 +184,34 @@ class CommandResponse(BaseModel):
     exit_code: int
 
 
+class SandboxUploadResponse(BaseModel):
+    """Sandbox upload response model"""
+
+    success: bool
+    message: str
+    files_uploaded: int | None = Field(None, alias="filesUploaded")
+    bytes_uploaded: int | None = Field(None, alias="bytesUploaded")
+    dest_path: str = Field(..., alias="destPath")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class SandboxDownloadStreamResponse(BaseModel):
+    """Sandbox download stream response model"""
+
+    stream: httpx.Response
+    src_path: str = Field(..., alias="srcPath")
+    content_type: str | None = Field(None, alias="contentType")
+    content_length: int | None = Field(None, alias="contentLength")
+
+    model_config = ConfigDict(populate_by_name=True, arbitrary_types_allowed=True)
+
+
 class SandboxClient:
     """Client for sandbox API operations"""
 
-    def __init__(self, api_client: APIClient):
+    def __init__(self, api_client: APIClient) -> None:
+        debug_log("SandboxClient constructor called")
         self.client = api_client
 
     def create(self, request: CreateSandboxRequest) -> Sandbox:
@@ -153,18 +227,18 @@ class SandboxClient:
 
     def list(
         self,
-        team_id: Optional[str] = None,
-        status: Optional[str] = None,
+        team_id: str | None = None,
+        status: str | None = None,
         page: int = 1,
         per_page: int = 50,
-        exclude_terminated: Optional[bool] = None,
+        exclude_terminated: bool | None = None,
     ) -> SandboxListResponse:
         """List sandboxes"""
         # Auto-populate team_id from config if not specified
         if team_id is None:
             team_id = self.client.config.team_id
 
-        params: Dict[str, Any] = {"page": page, "per_page": per_page}
+        params: dict[str, Any] = {"page": page, "per_page": per_page}
         if team_id:
             params["team_id"] = team_id
         if status:
@@ -180,7 +254,7 @@ class SandboxClient:
         response = self.client.request("GET", f"/sandbox/{sandbox_id}")
         return Sandbox(**response)
 
-    def delete(self, sandbox_id: str) -> Dict[str, Any]:
+    def delete(self, sandbox_id: str) -> dict[str, Any]:
         """Delete a sandbox"""
         response = self.client.request("DELETE", f"/sandbox/{sandbox_id}")
         return response
@@ -200,9 +274,9 @@ class SandboxClient:
         self,
         sandbox_id: str,
         command: str,
-        working_dir: Optional[str] = None,
-        env: Optional[Dict[str, str]] = None,
-        timeout: Optional[int] = None,
+        working_dir: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout: int | None = None,
     ) -> CommandResponse:
         """Execute a command in a sandbox
 
@@ -242,10 +316,15 @@ class SandboxClient:
         raise SandboxNotRunningError(sandbox_id, "Timeout during sandbox creation")
 
 
+
+
+
+
+
 class AsyncSandboxClient:
     """Async client for sandbox API operations"""
 
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: str | None = None) -> None:
         self.client = AsyncAPIClient(api_key=api_key)
 
     async def create(self, request: CreateSandboxRequest) -> Sandbox:
@@ -261,18 +340,18 @@ class AsyncSandboxClient:
 
     async def list(
         self,
-        team_id: Optional[str] = None,
-        status: Optional[str] = None,
+        team_id: str | None = None,
+        status: str | None = None,
         page: int = 1,
         per_page: int = 50,
-        exclude_terminated: Optional[bool] = None,
+        exclude_terminated: bool | None = None,
     ) -> SandboxListResponse:
         """List sandboxes"""
         # Auto-populate team_id from config if not specified
         if team_id is None:
             team_id = self.client.config.team_id
 
-        params: Dict[str, Any] = {"page": page, "per_page": per_page}
+        params: dict[str, Any] = {"page": page, "per_page": per_page}
         if team_id:
             params["team_id"] = team_id
         if status:
@@ -288,7 +367,7 @@ class AsyncSandboxClient:
         response = await self.client.request("GET", f"/sandbox/{sandbox_id}")
         return Sandbox(**response)
 
-    async def delete(self, sandbox_id: str) -> Dict[str, Any]:
+    async def delete(self, sandbox_id: str) -> dict[str, Any]:
         """Delete a sandbox"""
         response = await self.client.request("DELETE", f"/sandbox/{sandbox_id}")
         return response
@@ -308,9 +387,9 @@ class AsyncSandboxClient:
         self,
         sandbox_id: str,
         command: str,
-        working_dir: Optional[str] = None,
-        env: Optional[Dict[str, str]] = None,
-        timeout: Optional[int] = None,
+        working_dir: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout: int | None = None,
     ) -> CommandResponse:
         """Execute a command in a sandbox
 
@@ -338,8 +417,6 @@ class AsyncSandboxClient:
 
     async def wait_for_creation(self, sandbox_id: str, max_attempts: int = 60) -> None:
         """Wait for sandbox to be running (async version)"""
-        import asyncio
-
         for attempt in range(max_attempts):
             sandbox = await self.get(sandbox_id)
             if sandbox.status == "RUNNING":
@@ -363,3 +440,282 @@ class AsyncSandboxClient:
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Async context manager exit"""
         await self.aclose()
+
+    async def upload_file(
+        self,
+        sandbox_id: str,
+        dest_path: str,
+        file_path: str,
+        strip_components: int = 0,
+        working_dir: str | None = None,
+        timeout: int | None = None,
+    ) -> SandboxUploadResponse:
+        """Upload a tar archive file directly to the sandbox (async low-level method).
+        
+        This is the async version of the low-level upload method that expects a tar archive file.
+        Most users should use `upload_path()` instead, which handles tar creation automatically.
+        """
+        # Prepare form data
+        form_data: dict[str, Any] = {
+            "dest_path": dest_path,
+            "compressed": "false",
+            "strip_components": str(strip_components),
+        }
+        if working_dir:
+            form_data["working_dir"] = working_dir
+        
+        # Read file asynchronously
+        async with aiofiles.open(file_path, "rb") as file_handle:
+            file_content = await file_handle.read()
+        
+        # Prepare file data with appropriate content type
+        content_type = "application/x-tar"
+        files_data: dict[str, Any] = {"file": (os.path.basename(file_path), file_content, content_type)}
+        
+        raw_response = await self.client.multipart_post(
+            f"/sandbox/{sandbox_id}/upload",
+            files=files_data,
+            data=form_data,
+            timeout=timeout,
+        )
+        
+        return SandboxUploadResponse(
+            success=raw_response.get("success", True),
+            message=raw_response.get("message", "Upload completed successfully"),
+            filesUploaded=raw_response.get("filesUploaded"),
+            bytesUploaded=raw_response.get("bytesUploaded"),
+            destPath=dest_path,
+        )
+
+    async def download_stream(
+        self,
+        sandbox_id: str,
+        src_path: str,
+        working_dir: str | None = None,
+        timeout: int | None = None,
+    ) -> SandboxDownloadStreamResponse:
+        """Download a file/directory as a tar archive stream (async low-level method).
+        
+        This is the async version of the low-level download method that returns a raw tar 
+        archive stream.
+        Most users should use `download_path()` instead, which handles tar extraction automatically.
+        """
+        params: dict[str, Any] = {"src_path": src_path, "compress": "false"}
+        if working_dir:
+            params["working_dir"] = working_dir
+        
+        stream_response = await self.client.stream_get(
+            f"/sandbox/{sandbox_id}/download", params=params, timeout=timeout
+        )
+        
+        return SandboxDownloadStreamResponse(
+            stream=stream_response,
+            srcPath=src_path,
+            contentType=stream_response.headers.get("content-type"),
+            contentLength=int(stream_response.headers.get("content-length", 0)) if stream_response.headers.get("content-length") else None,
+        )
+
+    async def upload_path(
+        self,
+        sandbox_id: str,
+        local_path: str,
+        sandbox_path: str,
+        working_dir: str | None = None,
+        timeout: int | None = None,
+    ) -> SandboxUploadResponse:
+        """Upload a local file or directory to a sandbox (async high-level method).
+        
+        This is the async version of the recommended method for uploading files and directories.
+        It automatically handles tar archive creation and cleanup.
+        """
+        abs_path = os.path.abspath(local_path)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError(f"Path does not exist: {local_path}")
+        
+        # Warn users about large uploads (backend will enforce actual limits)
+        def get_path_size(path: str) -> int:
+            """Get total size of file or directory in bytes."""
+            if os.path.isfile(path):
+                return os.path.getsize(path)
+            total = 0
+            for dirpath, dirnames, filenames in os.walk(path):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    if os.path.exists(fp):
+                        total += os.path.getsize(fp)
+            return total
+        
+        # Get size in executor to avoid blocking
+        size = await asyncio.get_event_loop().run_in_executor(None, get_path_size, abs_path)
+        
+        # Just warn for large uploads - backend will handle the actual limits
+        if size > 100 * 1024 * 1024:  # Warn for files over 100MB
+            size_mb = size / (1024 * 1024)
+            debug_log(
+                f"Warning: Uploading {size_mb:.1f}MB. "
+                f"Backend may reject if over configured limit."
+            )
+        
+        # Create tar archive for all uploads (files and directories)
+        temp_file_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".tar") as tmp:
+                temp_file_path = tmp.name
+            
+            # Run tar creation in executor to avoid blocking
+            def create_tar() -> None:
+                with tarfile.open(temp_file_path, mode="w:") as tf:
+                    if os.path.isfile(local_path):
+                        # For single files, add with just the filename
+                        tf.add(local_path, arcname=os.path.basename(sandbox_path))
+                    else:
+                        # For directories, add the entire directory
+                        base_name = os.path.basename(local_path.rstrip("/"))
+                        tf.add(local_path, arcname=base_name)
+            
+            await asyncio.get_event_loop().run_in_executor(None, create_tar)
+            
+            # Upload the archive
+            result = await self.upload_file(
+                sandbox_id,
+                sandbox_path,
+                temp_file_path,
+                working_dir=working_dir,
+                timeout=timeout,
+            )
+            
+            return result
+            
+        finally:
+            # Clean up temporary file
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                except Exception:
+                    pass
+
+    async def download_path(
+        self,
+        sandbox_id: str,
+        sandbox_path: str,
+        local_path: str,
+        working_dir: str | None = None,
+        timeout: int | None = None,
+    ) -> None:
+        """Download a file or directory from a sandbox to local path (async high-level method).
+        
+        This is the async version of the recommended method for downloading files and directories.
+        It automatically handles tar stream extraction and file saving.
+        """
+        # Download from sandbox
+        response = await self.download_stream(
+            sandbox_id, sandbox_path, working_dir=working_dir, timeout=timeout
+        )
+        
+        if response.content_length == 0:
+            raise Exception("No data received from sandbox. The source path may not exist.")
+        
+        # Just warn for large downloads, don't block them
+        if (
+            response.content_length and response.content_length > 1024 * 1024 * 1024
+        ):  # Warn for downloads over 1GB
+            size_gb = response.content_length / (1024 * 1024 * 1024)
+            debug_log(f"Downloading large file ({size_gb:.2f}GB). This may take a while.")
+        
+        # Save stream to temp file first
+        temp_file_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".tar") as tmp_file:
+                temp_file_path = tmp_file.name
+            
+            # Write stream content asynchronously
+            async with aiofiles.open(temp_file_path, "wb") as async_file:
+                total_bytes = 0
+                async for chunk in response.stream.aiter_bytes(chunk_size=1024 * 64):
+                    if chunk:
+                        await async_file.write(chunk)
+                        total_bytes += len(chunk)
+            
+            # Extract the archive - run in executor to avoid blocking
+            def extract_tar() -> None:
+                with tarfile.open(temp_file_path, mode="r:") as tf:
+                    members = list(tf.getmembers())
+                    
+                    if not members:
+                        raise Exception("Tar archive is empty")
+                    
+                    # Ensure destination directory exists
+                    dst_abs = os.path.abspath(local_path)
+                    
+                    # Validate all members for security before extraction
+                    unsafe_members = []
+                    for member in members:
+                        # For single file extraction, validate against parent directory
+                        # For directory extraction, validate against destination directory
+                        validation_base = (
+                            os.path.dirname(dst_abs)
+                            if len(members) == 1 and members[0].isfile()
+                            else dst_abs
+                        )
+                        
+                        if not validate_tar_member(member, validation_base):
+                            unsafe_members.append(member.name)
+                    
+                    if unsafe_members:
+                        raise Exception(
+                            f"Tar archive contains unsafe paths that could escape the "
+                            f"destination directory: {unsafe_members[:5]}"
+                            + (" and more..." if len(unsafe_members) > 5 else "")
+                        )
+                    
+                    # Determine if this is a single file or directory
+                    is_single_file = len(members) == 1 and members[0].isfile()
+                    
+                    if is_single_file:
+                        # For single files, ensure parent directory exists
+                        os.makedirs(os.path.dirname(dst_abs), exist_ok=True)
+                        # Extract single file safely
+                        member = members[0]
+                        extract_file = tf.extractfile(member)
+                        if extract_file is not None:
+                            with open(dst_abs, "wb") as f:
+                                f.write(extract_file.read())
+                    else:
+                        # For directories, ensure the directory itself exists
+                        os.makedirs(dst_abs, exist_ok=True)
+                        # Extract all members safely 
+                        for member in members:
+                            # Skip invalid members
+                            if not member.name or member.name == "/":
+                                continue
+                                
+                            # Strip first component if it exists (common in tar archives)
+                            new_name = member.name
+                            if "/" in member.name:
+                                parts = member.name.split("/")
+                                if len(parts) > 1:
+                                    new_name = "/".join(parts[1:])
+                                    # Skip if name becomes empty after stripping
+                                    if not new_name or new_name == "/":
+                                        continue
+                            
+                            # Final safety check before extraction
+                            if is_safe_path(dst_abs, new_name):
+                                # Use a safe approach: create temp member with safe name
+                                temp_member = member
+                                original_name = member.name
+                                try:
+                                    member.name = new_name
+                                    tf.extract(member, path=dst_abs)
+                                finally:
+                                    member.name = original_name  # Restore original name
+            
+            await asyncio.get_event_loop().run_in_executor(None, extract_tar)
+            
+        finally:
+            # Clean up temporary file
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    os.unlink(temp_file_path)
+                except Exception:
+                    pass
