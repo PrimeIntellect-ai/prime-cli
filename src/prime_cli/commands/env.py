@@ -1,4 +1,5 @@
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -17,6 +18,8 @@ from rich.console import Console
 from rich.table import Table
 
 from ..api.client import APIClient, APIError
+from ..api.inference import InferenceAPIError, InferenceClient
+from ..config import Config
 from ..utils import output_data_as_json, validate_output_format
 
 app = typer.Typer(help="Manage verifiers environments")
@@ -1514,4 +1517,110 @@ def delete(
         raise typer.Exit(1)
     except Exception as e:
         console.print(f"[red]Unexpected error: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command(
+    "eval",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def eval_env(
+    ctx: typer.Context,
+    environment: str = typer.Argument(
+        ...,
+        help="Installed Verifiers environment name (e.g. 'wordle')",
+    ),
+    model: str = typer.Option(
+        "meta-llama/llama-3.1-70b-instruct",
+        "--model",
+        "-m",
+        help=(
+            "Model to use (e.g. 'meta-llama/llama-3.1-70b-instruct', see 'prime inference models' "
+            "for available models)"
+        ),
+    ),
+
+) -> None:
+    """
+    Run verifiers' vf-eval with Prime Inference
+
+    Example:
+       prime env eval meow -m qwen/qwen3-max -n 2 -r 3 -t 1024 -T 0.7
+       All extra args are forwarded unchanged to vf-eval.
+    """
+    config = Config()
+
+    api_key = config.api_key
+    inference_base_url = (config.inference_url or "").strip()
+
+    if not api_key:
+        console.print(
+            "[red]No API key configured.[/red] "
+            "Run [bold]prime login[/bold] or [bold]prime config set-api-key[/bold]."
+        )
+        raise typer.Exit(1)
+    if not inference_base_url:
+        console.print(
+            "[red]Inference URL not configured.[/red] "
+            "Check [bold]prime config view[/bold]."
+        )
+        raise typer.Exit(1)
+
+    # Fast fail if the model doesn't exist
+    client = InferenceClient()
+    try:
+        client.retrieve_model(model)
+    except InferenceAPIError as e:
+        console.print(
+            f"[red]Invalid model:[/red] {e} \n\n"
+            f"[b]Use 'prime inference models' to see available models.[/b]"
+        )
+        raise typer.Exit(1)
+
+    # Append /api/v1 only if not already present
+    inference_base_url_no_slash = inference_base_url.rstrip("/")
+    if inference_base_url_no_slash.endswith("/api/v1"):
+        inference_url = inference_base_url_no_slash
+    else:
+        inference_url = inference_base_url_no_slash + "/api/v1"
+
+    cmd = ["uv", "run", "vf-eval", environment]
+
+    # Extra user args (unknown options) from Typer/Click
+    user_args = list(ctx.args)
+
+    def _has_flag(names: tuple[str, ...]) -> bool:
+        for a in user_args:
+            for n in names:
+                if a == n or (n.startswith("--") and a.startswith(n + "=")):
+                    return True
+        return False
+
+    # Inject base URL and API key unless caller provided their own
+    if not _has_flag(("-b", "--base-url")):
+        cmd += ["-b", inference_url]
+
+    # Always pass the selected model (since it's a required option)
+    cmd += ["-m", model]
+
+    # Environment modificaiton may be necessary for passing in API key
+    env = os.environ.copy()
+
+    # Set PRIME_API_KEY if user did not provider api key var
+    if not _has_flag(("-k", "--api-key-var")):
+        env["PRIME_API_KEY"] = api_key
+        cmd += ["-k", "PRIME_API_KEY"]
+
+    # Forward everything else untouched
+    cmd += user_args
+
+    # Execute; stream output directly
+    try:
+        result = subprocess.run(cmd, env=env)
+        if result.returncode != 0:
+            raise typer.Exit(result.returncode)
+    except KeyboardInterrupt:
+        raise typer.Exit(130)
+    except FileNotFoundError:
+        console.print("[red]Failed to start vf-eval process.[/red]")
         raise typer.Exit(1)
