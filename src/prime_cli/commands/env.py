@@ -1603,7 +1603,7 @@ def eval_env(
         raise typer.Exit(1)
     if not inference_base_url:
         console.print(
-            "[red]Inference URL not configured.[/red] " "Check [bold]prime config view[/bold]."
+            "[red]Inference URL not configured.[/red] Check [bold]prime config view[/bold]."
         )
         raise typer.Exit(1)
 
