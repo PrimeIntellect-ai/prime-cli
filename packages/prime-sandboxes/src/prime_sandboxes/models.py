@@ -39,6 +39,7 @@ class Sandbox(BaseModel):
     disk_size_gb: int = Field(..., alias="diskSizeGB")
     disk_mount_path: str = Field(..., alias="diskMountPath")
     gpu_count: int = Field(..., alias="gpuCount")
+    gpu_type: Optional[str] = Field(None, alias="gpuType")
     status: str
     timeout_minutes: int = Field(..., alias="timeoutMinutes")
     environment_vars: Optional[Dict[str, Any]] = Field(None, alias="environmentVars")
@@ -78,11 +79,13 @@ class CreateSandboxRequest(BaseModel):
     memory_gb: int = 2
     disk_size_gb: int = 5
     gpu_count: int = 0
+    gpu_type: Optional[str] = None
     timeout_minutes: int = 60
     environment_vars: Optional[Dict[str, str]] = None
     labels: List[str] = Field(default_factory=list)
     team_id: Optional[str] = None
     advanced_configs: Optional[AdvancedConfigs] = None
+    region: Optional[str] = None
 
 
 class UpdateSandboxRequest(BaseModel):
@@ -143,3 +146,18 @@ class BulkDeleteSandboxResponse(BaseModel):
     succeeded: List[str]
     failed: List[Dict[str, str]]
     message: str
+
+
+class SandboxAvailableRegionsResponse(BaseModel):
+    """Available regions response model"""
+
+    regions: List[str]
+
+
+class RegionAvailability(BaseModel):
+    region: str
+    available: int
+
+
+class SandboxGPUAvailabilityResponse(BaseModel):
+    availability: Dict[str, List[RegionAvailability]]
