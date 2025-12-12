@@ -25,7 +25,7 @@ from prime_cli.core import Config
 from ..api.inference import InferenceAPIError, InferenceClient
 from ..client import APIClient, APIError
 from ..utils import output_data_as_json, validate_output_format
-from ..utils.env_metadata import find_environment_metadata
+from ..utils.env_metadata import find_environment_metadata, get_environment_metadata
 from ..utils.eval_push import push_eval_results_to_hub
 from ..utils.formatters import format_file_size
 
@@ -1679,6 +1679,174 @@ def uninstall(
         console.print("\n[yellow]Uninstall cancelled by user[/yellow]")
         raise typer.Exit(1)
     except Exception as e:
+        console.print(f"[red]Unexpected error: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command()
+def sync(
+    path: str = typer.Option(".", "--path", "-p", help="Path to environment directory"),
+    auto_bump: bool = typer.Option(
+        False, "--auto-bump", help="Automatically bump patch version if local changes exist"
+    ),
+    rc: bool = typer.Option(False, "--rc", help="Bump or create a .rc pre-release (rc0 -> rc1)"),
+    post: bool = typer.Option(
+        False,
+        "--post",
+        help="Bump or create a .post release (post0 -> post1)",
+    ),
+    force: bool = typer.Option(False, "--force", "-f", help="Push even if already in sync"),
+) -> None:
+    """Sync local environment with remote hub.
+
+    Checks if local content differs from remote and pushes changes if needed.
+    Requires the environment to have been previously pushed (has metadata).
+    """
+    try:
+        env_path = Path(path).resolve()
+
+        # Check for pyproject.toml
+        pyproject_path = env_path / "pyproject.toml"
+        if not pyproject_path.exists():
+            console.print("[red]Error: pyproject.toml not found[/red]")
+            raise typer.Exit(1)
+
+        # Read environment metadata to get owner/name
+        env_metadata = get_environment_metadata(env_path)
+        if not env_metadata:
+            console.print(
+                "[red]Error: No environment metadata found.[/red]\n"
+                "[dim]This environment hasn't been pushed yet. Use 'prime env push' first.[/dim]"
+            )
+            raise typer.Exit(1)
+
+        owner = env_metadata.get("owner")
+        env_name = env_metadata.get("name")
+
+        if not owner or not env_name:
+            console.print(
+                "[red]Error: Invalid metadata - missing owner or name.[/red]\n"
+                "[dim]Try running 'prime env push' to fix the metadata.[/dim]"
+            )
+            raise typer.Exit(1)
+
+        env_id = f"{owner}/{env_name}"
+        console.print(f"Syncing [cyan]{env_id}[/cyan]...")
+
+        # Compute local content hash
+        local_content_hash = compute_content_hash(env_path)
+        console.print(f"Local content hash: [yellow]{local_content_hash[:8]}[/yellow]")
+
+        # Fetch remote versions to check if our content hash exists
+        client = APIClient()
+
+        try:
+            response = client.get(f"/environmentshub/{owner}/{env_name}/versions")
+            if "data" in response:
+                versions_data = response["data"]
+            else:
+                versions_data = response
+
+            if isinstance(versions_data, list):
+                versions_list = versions_data
+            else:
+                versions_list = versions_data.get("versions", [])
+
+        except APIError as e:
+            if "404" in str(e):
+                console.print(
+                    "[yellow]Environment not found on remote. It may have been deleted.[/yellow]"
+                )
+                console.print("[dim]Use 'prime env push' to re-create it.[/dim]")
+                raise typer.Exit(1)
+            console.print(f"[red]Failed to fetch remote versions: {e}[/red]")
+            raise typer.Exit(1)
+
+        # Check if local content hash exists in remote versions
+        # Note: content_hash is the directory content hash, sha256 is the wheel file hash
+        remote_hashes = {v.get("content_hash", "") for v in versions_list}
+        is_in_sync = local_content_hash in remote_hashes
+
+        if is_in_sync and not force:
+            console.print("[green]✓ Already in sync with remote[/green]")
+
+            # Show which version matches
+            for v in versions_list:
+                if v.get("content_hash") == local_content_hash:
+                    console.print(
+                        f"[dim]Local content matches remote version "
+                        f"{v.get('version', 'unknown')}[/dim]"
+                    )
+                    break
+            return
+
+        if is_in_sync and force:
+            console.print(
+                "[yellow]Already in sync, but --force specified. Pushing anyway...[/yellow]"
+            )
+
+        # Not in sync - need to push
+        if not is_in_sync:
+            console.print("[yellow]Local changes detected. Pushing to remote...[/yellow]")
+
+        # Read pyproject.toml for version info
+        try:
+            pyproject_data = toml.load(pyproject_path)
+            project_info = pyproject_data.get("project", {})
+            current_version = project_info.get("version")
+        except Exception as e:
+            console.print(f"[red]Failed to parse pyproject.toml: {e}[/red]")
+            raise typer.Exit(1)
+
+        # Handle version bumping if requested
+        if auto_bump or rc or post:
+            flags_set = sum(bool(x) for x in (auto_bump, rc, post))
+            if flags_set > 1:
+                console.print(
+                    "[red]Error: --auto-bump, --rc, and --post are mutually exclusive[/red]"
+                )
+                raise typer.Exit(1)
+
+            if not current_version:
+                console.print("[red]Error: No version found in pyproject.toml for auto-bump[/red]")
+                raise typer.Exit(1)
+
+            if auto_bump:
+                new_version = bump_version(current_version)
+            elif rc:
+                new_version = bump_rc_version(current_version)
+            else:
+                new_version = bump_post_version(current_version)
+
+            console.print(f"Auto-bumping version: {current_version} → {new_version}")
+
+            try:
+                update_pyproject_version(pyproject_path, new_version)
+                console.print("[green]✓ Updated version in pyproject.toml[/green]")
+            except Exception as e:
+                console.print(f"[red]Failed to update version in pyproject.toml: {e}[/red]")
+                raise typer.Exit(1)
+
+        # Invoke the push command programmatically by calling the push logic
+        # We'll use subprocess to call the push command to reuse all its logic
+        # Pass --owner to ensure we push to the same namespace as the original push
+        push_cmd = ["prime", "env", "push", "--path", str(env_path), "--owner", owner]
+        console.print("\n[dim]Running push...[/dim]")
+
+        try:
+            result = subprocess.run(push_cmd, cwd=env_path)
+            if result.returncode != 0:
+                raise typer.Exit(result.returncode)
+        except FileNotFoundError:
+            console.print("[red]Failed to run push command[/red]")
+            raise typer.Exit(1)
+
+    except APIError as e:
+        console.print(f"[red]API Error: {e}[/red]")
+        raise typer.Exit(1)
+    except Exception as e:
+        if isinstance(e, typer.Exit):
+            raise
         console.print(f"[red]Unexpected error: {e}[/red]")
         raise typer.Exit(1)
 
